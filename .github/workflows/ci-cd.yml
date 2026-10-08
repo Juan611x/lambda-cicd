@@ -28,6 +28,7 @@ concurrency:
 env:
   PYTHON_VERSION: "3.13"
   ARTIFACT_NAME: lambda-package
+  LAMBDA_HANDLER: lambda_function.lambda_handler
 
 defaults:
   run:
@@ -200,12 +201,15 @@ jobs:
             --output table
           aws lambda wait function-updated --function-name "$FUNCTION_NAME"
 
-      - name: Registrar el commit desplegado
+      - name: Aplicar la configuración de la función
         run: |
+          # El runtime y el handler se fijan aquí para que no dependan de cómo se creó la función
           aws lambda update-function-configuration \
             --function-name "$FUNCTION_NAME" \
+            --runtime "python${PYTHON_VERSION}" \
+            --handler "$LAMBDA_HANDLER" \
             --environment "Variables={APP_VERSION=${GITHUB_SHA::7}}" \
-            --query '{Funcion: FunctionName, Variables: Environment.Variables}' \
+            --query '{Funcion: FunctionName, Runtime: Runtime, Handler: Handler, Variables: Environment.Variables}' \
             --output json
           aws lambda wait function-updated --function-name "$FUNCTION_NAME"
 
