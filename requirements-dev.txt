@@ -1,0 +1,4 @@
+# Herramientas de desarrollo y de pipeline (no se empaquetan con la función).
+# Versiones fijadas para que cada ejecución use exactamente las mismas.
+pytest==9.1.1
+ruff==0.16.10

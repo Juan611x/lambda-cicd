@@ -1,0 +1,263 @@
+# Pipeline de CI/CD: valida la función y la despliega en AWS Lambda.
+#
+#   push a main  ->  build  ->  test  ->  deploy
+#
+# Cada etapa es un job independiente y solo arranca si la anterior terminó bien.
+# El paquete se construye una sola vez (build) y ese mismo archivo es el que se
+# prueba (test) y el que se despliega (deploy).
+#
+# Configuración necesaria en el repositorio (ver README):
+#   Variables: AWS_REGION, LAMBDA_FUNCTION_NAME y, si se usa OIDC, AWS_ROLE_ARN.
+#   Secretos (solo sin OIDC): AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN.
+
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+
+# Por defecto el pipeline solo puede leer el repositorio; deploy amplía lo justo.
+permissions:
+  contents: read
+
+# Si llegan dos push seguidos, los despliegues se ejecutan en orden, no a la vez.
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.13"
+  ARTIFACT_NAME: lambda-package
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # --------------------------------------------------------------------------
+  # BUILD: revisa el código y genera el paquete que se va a desplegar
+  # --------------------------------------------------------------------------
+  build:
+    name: Build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      sha256: ${{ steps.package.outputs.sha256 }}
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Preparar Python
+        uses: ./.github/actions/setup-python-env
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Revisar estilo y errores (ruff)
+        run: |
+          ruff check --output-format=github .
+          ruff format --check .
+
+      - name: Empaquetar la función
+        id: package
+        run: python scripts/package.py
+
+      - name: Publicar el paquete como artefacto
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: build/lambda.zip
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Resumen
+        run: |
+          {
+            echo "### Build"
+            echo "| Dato | Valor |"
+            echo "|---|---|"
+            echo "| Commit | \`${GITHUB_SHA::7}\` |"
+            echo "| Archivos en el paquete | ${{ steps.package.outputs.files }} |"
+            echo "| Tamaño | ${{ steps.package.outputs.size }} bytes |"
+            echo "| SHA-256 | \`${{ steps.package.outputs.sha256 }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # --------------------------------------------------------------------------
+  # TEST: ejecuta las pruebas contra el paquete generado en build
+  # --------------------------------------------------------------------------
+  test:
+    name: Test
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Preparar Python
+        uses: ./.github/actions/setup-python-env
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Descargar el paquete de build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: build
+
+      - name: Verificar y desempaquetar el paquete
+        run: |
+          echo "${{ needs.build.outputs.sha256 }}  build/lambda.zip" | sha256sum --check
+          unzip -q build/lambda.zip -d build/package
+          ls -l build/package
+
+      - name: Ejecutar las pruebas (pytest)
+        run: pytest -v -o pythonpath=build/package --junitxml=build/test-results.xml
+
+      - name: Resumen
+        if: always()
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import pathlib
+          import xml.etree.ElementTree as ET
+
+          print("### Test")
+          report = pathlib.Path("build/test-results.xml")
+          if not report.exists():
+              print("No se generó el informe de pruebas: revisa los pasos anteriores.")
+              raise SystemExit
+          suite = ET.parse(report).getroot().find("testsuite")
+          total, failed = int(suite.get("tests")), int(suite.get("failures")) + int(suite.get("errors"))
+          print("| Pruebas | Correctas | Fallidas | Duración |")
+          print("|---|---|---|---|")
+          print(f"| {total} | {total - failed} | {failed} | {float(suite.get('time')):.2f} s |")
+          PY
+
+  # --------------------------------------------------------------------------
+  # DEPLOY: sube el mismo paquete a AWS Lambda y comprueba que responde
+  # --------------------------------------------------------------------------
+  deploy:
+    name: Deploy
+    needs: [build, test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write # Solo se usa si la autenticación es por OIDC (AWS_ROLE_ARN)
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      FUNCTION_NAME: ${{ vars.LAMBDA_FUNCTION_NAME }}
+      HAS_ACCESS_KEYS: ${{ secrets.AWS_ACCESS_KEY_ID != '' }}
+    steps:
+      # Admite dos formas de autenticarse en AWS:
+      #   - OIDC: variable AWS_ROLE_ARN. Sin claves guardadas; recomendada en cuentas propias.
+      #   - Credenciales temporales: secretos AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY y
+      #     AWS_SESSION_TOKEN. Para cuentas de laboratorio que no permiten crear roles de IAM.
+      - name: Comprobar la configuración del repositorio
+        run: |
+          missing=0
+          for name in AWS_REGION FUNCTION_NAME; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Falta la variable del repositorio que alimenta $name (Settings > Secrets and variables > Actions > Variables)."
+              missing=1
+            fi
+          done
+          if [ -n "$AWS_ROLE_ARN" ]; then
+            echo "Autenticación: OIDC, asumiendo el rol $AWS_ROLE_ARN"
+          elif [ "$HAS_ACCESS_KEYS" = "true" ]; then
+            echo "Autenticación: credenciales temporales guardadas en los secretos del repositorio"
+          else
+            echo "::error::No hay forma de autenticarse en AWS: define la variable AWS_ROLE_ARN o los secretos AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY y AWS_SESSION_TOKEN."
+            missing=1
+          fi
+          exit "$missing"
+
+      - name: Descargar el paquete de build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+
+      - name: Verificar el paquete
+        run: echo "${{ needs.build.outputs.sha256 }}  lambda.zip" | sha256sum --check
+
+      - name: Configurar las credenciales de AWS
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          role-session-name: github-actions-${{ github.run_id }}
+          aws-access-key-id: ${{ env.AWS_ROLE_ARN == '' && secrets.AWS_ACCESS_KEY_ID || '' }}
+          aws-secret-access-key: ${{ env.AWS_ROLE_ARN == '' && secrets.AWS_SECRET_ACCESS_KEY || '' }}
+          aws-session-token: ${{ env.AWS_ROLE_ARN == '' && secrets.AWS_SESSION_TOKEN || '' }}
+          mask-aws-account-id: true # El número de cuenta no aparece en los logs
+
+      - name: Subir el código a Lambda
+        run: |
+          aws lambda update-function-code \
+            --function-name "$FUNCTION_NAME" \
+            --zip-file fileb://lambda.zip \
+            --query '{Funcion: FunctionName, Runtime: Runtime, CodeSha256: CodeSha256, Estado: LastUpdateStatus}' \
+            --output table
+          aws lambda wait function-updated --function-name "$FUNCTION_NAME"
+
+      - name: Registrar el commit desplegado
+        run: |
+          aws lambda update-function-configuration \
+            --function-name "$FUNCTION_NAME" \
+            --environment "Variables={APP_VERSION=${GITHUB_SHA::7}}" \
+            --query '{Funcion: FunctionName, Variables: Environment.Variables}' \
+            --output json
+          aws lambda wait function-updated --function-name "$FUNCTION_NAME"
+
+      - name: Publicar una versión de la función
+        id: publish
+        run: |
+          version=$(aws lambda publish-version \
+            --function-name "$FUNCTION_NAME" \
+            --description "Commit ${GITHUB_SHA::7} · ejecución ${GITHUB_RUN_NUMBER}" \
+            --query Version --output text)
+          echo "Versión publicada: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Prueba de humo sobre la versión desplegada
+        env:
+          VERSION: ${{ steps.publish.outputs.version }}
+        run: |
+          aws lambda invoke \
+            --function-name "$FUNCTION_NAME" \
+            --qualifier "$VERSION" \
+            --cli-binary-format raw-in-base64-out \
+            --payload '{"distance_km": 8.5, "duration_min": 22}' \
+            response.json > invoke.json
+
+          echo "::group::Respuesta de la función"
+          jq . response.json
+          echo "::endgroup::"
+
+          if [ "$(jq -r '.FunctionError // empty' invoke.json)" != "" ]; then
+            echo "::error::La función terminó con error: $(jq -c . response.json)"
+            exit 1
+          fi
+
+          status=$(jq -r '.statusCode' response.json)
+          total=$(jq -r '.body | fromjson | .total' response.json)
+          deployed=$(jq -r '.body | fromjson | .version' response.json)
+          echo "Estado: $status · Total: $total · Versión del código: $deployed"
+
+          [ "$status" = "200" ] || { echo "::error::Se esperaba statusCode 200 y llegó $status"; exit 1; }
+          [ "$total" = "18100" ] || { echo "::error::Se esperaba un total de 18100 y llegó $total"; exit 1; }
+          [ "$deployed" = "${GITHUB_SHA::7}" ] || { echo "::error::La función no ejecuta el commit ${GITHUB_SHA::7}, sino $deployed"; exit 1; }
+          echo "Prueba de humo superada."
+
+      - name: Resumen
+        run: |
+          {
+            echo "### Deploy"
+            echo "| Dato | Valor |"
+            echo "|---|---|"
+            echo "| Función | \`$FUNCTION_NAME\` |"
+            echo "| Región | \`$AWS_REGION\` |"
+            echo "| Versión publicada | ${{ steps.publish.outputs.version }} |"
+            echo "| Commit desplegado | \`${GITHUB_SHA::7}\` |"
+            echo "| Prueba de humo | Superada |"
+          } >> "$GITHUB_STEP_SUMMARY"

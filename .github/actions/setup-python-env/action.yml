@@ -1,0 +1,33 @@
+# Acción reutilizable: deja listo el entorno de Python que usan los jobs de build y test.
+# Así la preparación se define una sola vez y todos los jobs trabajan con el mismo entorno.
+name: Preparar entorno de Python
+description: Instala la versión indicada de Python y las herramientas de desarrollo, con caché de pip.
+
+inputs:
+  python-version:
+    description: Versión de Python que se instala.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Instalar Python ${{ inputs.python-version }}
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: ${{ inputs.python-version }}
+        cache: pip
+        cache-dependency-path: requirements-dev.txt
+
+    - name: Instalar herramientas de desarrollo
+      shell: bash
+      run: |
+        echo "::group::pip install -r requirements-dev.txt"
+        python -m pip install --disable-pip-version-check -r requirements-dev.txt
+        echo "::endgroup::"
+
+    - name: Mostrar versiones
+      shell: bash
+      run: |
+        python --version
+        ruff --version
+        pytest --version

@@ -1,0 +1,2 @@
+# Dependencias que se empaquetan con la función.
+# De momento no hay ninguna: el código solo usa la biblioteca estándar de Python.
